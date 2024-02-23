@@ -227,6 +227,20 @@ func (c *connection) Flush() error {
 	return c.flush()
 }
 
+// FlushAndCount 原有的Flush不能返回Flush的长度，该方法可以使其返回Flush长度
+func (c *connection) FlushAndCount() (int, error) {
+
+	// 以下过程和原有Flush方法一致，只不过在调用c.flush方法前,获取了outputBuffer的长度
+	if !c.IsActive() || !c.lock(flushing) {
+		return 0, Exception(ErrConnClosed, "when flush")
+	}
+	defer c.unlock(flushing)
+	c.outputBuffer.Flush()
+	count := c.outputBuffer.Len()
+
+	return count, c.flush()
+}
+
 // MallocAck implements Connection.
 func (c *connection) MallocAck(n int) (err error) {
 	return c.outputBuffer.MallocAck(n)
@@ -459,6 +473,10 @@ RET:
 		<-c.readTimer.C
 	}
 	return err
+}
+
+func (c *connection) WriteLen() int {
+	return c.outputBuffer.Len()
 }
 
 // flush write data directly.

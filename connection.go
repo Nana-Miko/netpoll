@@ -27,10 +27,10 @@ type CloseCallback func(connection Connection) error
 // but does not support simultaneous reading or writing by multiple goroutines.
 // It maintains its own input/output buffer, and provides nocopy API for reading and writing.
 type Connection interface {
+	FlushCounter
 	// Connection extends net.Conn, just for interface compatibility.
 	// It's not recommended to use net.Conn API except for io.Closer.
 	net.Conn
-
 	// The recommended API for nocopy reading and writing.
 	// Reader will return nocopy buffer data, or error after timeout which set by SetReadTimeout.
 	Reader() Reader

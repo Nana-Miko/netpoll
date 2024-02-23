@@ -15,14 +15,13 @@
 package mux
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
 
-	"github.com/bytedance/gopkg/util/gopool"
-
-	"github.com/cloudwego/netpoll"
+	"github.com/nana-miko/netpoll"
 )
 
 /* DOC:
@@ -40,24 +39,15 @@ func init() {
 	ShardSize = runtime.GOMAXPROCS(0)
 }
 
-// NewShardQueue .
-func NewShardQueue(size int, conn netpoll.Connection) (queue *ShardQueue) {
-	queue = &ShardQueue{
-		conn:    conn,
-		size:    int32(size),
-		getters: make([][]WriterGetter, size),
-		swap:    make([]WriterGetter, 0, 64),
-		locks:   make([]int32, size),
-	}
-	for i := range queue.getters {
-		queue.getters[i] = make([]WriterGetter, 0, 64)
-	}
-	queue.list = make([]int32, size)
-	return queue
-}
+var ErrShardQueueClosed = errors.New("shardQueue has been closed")
+var ErrDataEmpty = errors.New("data is empty")
 
-// WriterGetter is used to get a netpoll.Writer.
-type WriterGetter func() (buf netpoll.Writer, isNil bool)
+// NewShardQueue
+// quota可以限制queue的最大内存配额
+// 推荐quota为data大小的10-40倍左右
+func NewShardQueue(quota int, conn netpoll.Connection) AsyncWriter {
+	return newShardQueue(ShardSize, quota, conn)
+}
 
 // ShardQueue uses the netpoll's nocopy API to merge and send data.
 // The Data Flush is passively triggered by ShardQueue.Add and does not require user operations.
@@ -66,10 +56,14 @@ type WriterGetter func() (buf netpoll.Writer, isNil bool)
 type ShardQueue struct {
 	conn      netpoll.Connection
 	idx, size int32
-	getters   [][]WriterGetter // len(getters) = size
-	swap      []WriterGetter   // use for swap
-	locks     []int32          // len(locks) = size
+	getters   [][]*netpoll.AsyncLinkBuffer // len(getters) = size
+	swap      []*netpoll.AsyncLinkBuffer   // use for swap
+	locks     []int32                      // len(locks) = size
+
 	queueTrigger
+
+	wq   *writeQuota
+	done chan struct{}
 }
 
 const (
@@ -89,25 +83,83 @@ type queueTrigger struct {
 	listLock sync.Mutex // list total lock
 }
 
+// NewShardQueue .
+func newShardQueue(size int, quota int, conn netpoll.Connection) (queue *ShardQueue) {
+
+	queue = &ShardQueue{
+		conn:    conn,
+		size:    int32(size),
+		getters: make([][]*netpoll.AsyncLinkBuffer, size),
+		swap:    make([]*netpoll.AsyncLinkBuffer, 0, 64),
+		locks:   make([]int32, size),
+		done:    make(chan struct{}),
+	}
+	for i := range queue.getters {
+		queue.getters[i] = make([]*netpoll.AsyncLinkBuffer, 0, 64)
+	}
+
+	queue.list = make([]int32, size)
+
+	queue.wq = newWriteQuota(int32(quota), queue.done)
+
+	return queue
+}
+
+func (q *ShardQueue) AsyncWrite(ctx context.Context, data SizedEncodable, cb netpoll.CallBack) {
+	if atomic.LoadInt32(&q.state) != active {
+		cb(ErrShardQueueClosed)
+		return
+	}
+	err := q.wq.getWithCtx(ctx, int32(data.EncodedLen()))
+	if err != nil {
+		cb(err)
+		return
+	}
+	lb := netpoll.NewAsyncLinkBuffer(data.EncodedLen(), cb)
+
+	err = data.ZeroCopyEncode(lb)
+	if err != nil {
+		lb.Recycle()
+		cb(err)
+		return
+	}
+	if lb.Len() <= 0 {
+		lb.Recycle()
+		cb(ErrDataEmpty)
+		return
+	}
+
+	q.Add(lb)
+}
+
+func (q *ShardQueue) taskAdd(value any) {
+	q.Add(value.(*netpoll.AsyncLinkBuffer))
+}
+
 // Add adds to q.getters[shard]
-func (q *ShardQueue) Add(gts ...WriterGetter) {
+func (q *ShardQueue) Add(gts *netpoll.AsyncLinkBuffer) {
 	if atomic.LoadInt32(&q.state) != active {
 		return
 	}
 	shard := atomic.AddInt32(&q.idx, 1) % q.size
 	q.lock(shard)
 	trigger := len(q.getters[shard]) == 0
-	q.getters[shard] = append(q.getters[shard], gts...)
+	q.getters[shard] = append(q.getters[shard], gts)
 	q.unlock(shard)
 	if trigger {
 		q.triggering(shard)
 	}
+
 }
 
 func (q *ShardQueue) Close() error {
 	if !atomic.CompareAndSwapInt32(&q.state, active, closing) {
-		return fmt.Errorf("shardQueue has been closed")
+		return ErrShardQueueClosed
 	}
+
+	// 关闭wq
+	close(q.done)
+
 	// wait for all tasks finished
 	for atomic.LoadInt32(&q.state) != closed {
 		if atomic.LoadInt32(&q.trigger) == 0 {
@@ -137,58 +189,75 @@ func (q *ShardQueue) foreach() {
 	if atomic.AddInt32(&q.runNum, 1) > 1 {
 		return
 	}
-	gopool.CtxGo(nil, func() {
-		var negNum int32 // is negative number of triggerNum
-		for triggerNum := atomic.LoadInt32(&q.trigger); triggerNum > 0; {
-			q.r = (q.r + 1) % q.size
-			shared := q.list[q.r]
+	netpoll.Go(q.processQueue)
+}
 
-			// lock & swap
-			q.lock(shared)
-			tmp := q.getters[shared]
-			q.getters[shared] = q.swap[:0]
-			q.swap = tmp
-			q.unlock(shared)
+func (q *ShardQueue) processQueue() {
+	cbt := NewCbTaskList()
 
-			// deal
-			q.deal(q.swap)
-			negNum--
-			if triggerNum+negNum == 0 {
-				triggerNum = atomic.AddInt32(&q.trigger, negNum)
-				negNum = 0
-			}
+	var negNum int32 // is negative number of triggerNum
+	for triggerNum := atomic.LoadInt32(&q.trigger); triggerNum > 0; {
+		q.r = (q.r + 1) % q.size
+		shared := q.list[q.r]
+
+		// lock & swap
+		q.lock(shared)
+		tmp := q.getters[shared]
+		q.getters[shared] = q.swap[:0]
+		q.swap = tmp
+		q.unlock(shared)
+
+		// deal
+		q.deal(q.swap, cbt)
+		negNum--
+		if triggerNum+negNum == 0 {
+			triggerNum = atomic.AddInt32(&q.trigger, negNum)
+			negNum = 0
 		}
-		q.flush()
+	}
+	q.flush(cbt)
 
-		// quit & check again
-		atomic.StoreInt32(&q.runNum, 0)
-		if atomic.LoadInt32(&q.trigger) > 0 {
-			q.foreach()
-			return
-		}
-		// if state is closing, change it to closed
-		atomic.CompareAndSwapInt32(&q.state, closing, closed)
-	})
+	// quit & check again
+	atomic.StoreInt32(&q.runNum, 0)
+	if atomic.LoadInt32(&q.trigger) > 0 {
+		q.foreach()
+		return
+	}
+	// if state is closing, change it to closed
+	atomic.CompareAndSwapInt32(&q.state, closing, closed)
+
 }
 
 // deal is used to get deal of netpoll.Writer.
-func (q *ShardQueue) deal(gts []WriterGetter) {
+func (q *ShardQueue) deal(bufs []*netpoll.AsyncLinkBuffer, cbt *CbTaskList) {
 	writer := q.conn.Writer()
-	for _, gt := range gts {
-		buf, isNil := gt()
-		if !isNil {
-			err := writer.Append(buf)
-			if err != nil {
-				q.conn.Close()
-				return
-			}
+	for _, buf := range bufs {
+
+		// 此处的writer为conn底层的writer
+		err := writer.Append(buf.LinkBuffer)
+		if err != nil {
+			q.conn.Close()
+			return
 		}
+		// 添加回调到链表
+		cbt.Append(buf.GetCallBack())
+		// 回收AsyncLinkBuffer
+		buf.Recycle()
 	}
 }
 
 // flush is used to flush netpoll.Writer.
-func (q *ShardQueue) flush() {
-	err := q.conn.Writer().Flush()
+func (q *ShardQueue) flush(cbt *CbTaskList) {
+	flushedCount, err := q.conn.FlushAndCount()
+	// 归还quota
+	q.wq.replenish(flushedCount)
+
+	// flush后通知回调
+	netpoll.Go(func() {
+		cbt.Foreach(err)
+		cbt.Recycle()
+	})
+
 	if err != nil {
 		q.conn.Close()
 		return

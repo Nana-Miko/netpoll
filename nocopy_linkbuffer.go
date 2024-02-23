@@ -34,7 +34,9 @@ import (
 const BinaryInplaceThreshold = block4k
 
 // LinkBufferCap that can be modified marks the minimum value of each node of LinkBuffer.
-var LinkBufferCap = block4k
+// TODO 通过配置修改LinkBufferCap
+// 该值决定每个LinkBufferNode的Cap最小分配量
+var LinkBufferCap = block1k
 
 // NewLinkBuffer size defines the initial capacity, but there is no readable data.
 func NewLinkBuffer(size ...int) *LinkBuffer {
@@ -77,7 +79,7 @@ func (b *LinkBuffer) IsEmpty() (ok bool) {
 	return b.Len() == 0
 }
 
-// Reuse reactivates a LinkBuffer that has been closed or appended to another LinkBuffer.
+// Reuse 将已关闭或者是Append到其他LinkBuffer后的LinkBuffer重新启用
 func (b *LinkBuffer) Reuse(size ...int) {
 	if b.enable {
 		return
@@ -86,7 +88,7 @@ func (b *LinkBuffer) Reuse(size ...int) {
 	b.enable = true
 }
 
-// Initialize initializes a LinkBuffer.
+// Initialize 初始化LinkBuffer
 func (b *LinkBuffer) Initialize(size ...int) {
 	var l int
 	if len(size) > 0 {
@@ -403,6 +405,13 @@ func (b *LinkBuffer) Flush() (err error) {
 	// re-cal length
 	b.recalLen(n)
 	return nil
+}
+
+func (b *LinkBuffer) FlushAndCount() (int, error) {
+	before := b.Len()
+	err := b.Flush()
+	after := b.Len()
+	return before - after, err
 }
 
 // Append implements Writer.

@@ -22,7 +22,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cloudwego/netpoll"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/nana-miko/netpoll"
+
+	_ "net/http/pprof"
 )
 
 func TestShardQueue(t *testing.T) {
@@ -51,19 +55,20 @@ func TestShardQueue(t *testing.T) {
 	}()
 
 	conn, err := netpoll.DialConnection(network, address, time.Second)
+
 	MustNil(t, err)
 	<-accepted
 
 	// test
-	queue := NewShardQueue(4, conn)
 	count, pkgsize := 16, 11
-	for i := 0; i < int(count); i++ {
-		var getter WriterGetter = func() (buf netpoll.Writer, isNil bool) {
-			buf = netpoll.NewLinkBuffer(pkgsize)
-			buf.Malloc(pkgsize)
-			return buf, false
-		}
-		queue.Add(getter)
+	queue := newShardQueue(4, pkgsize*100, conn)
+	assert.NoError(t, err)
+	for i := 0; i < count; i++ {
+		pb := new(netpoll.AsyncLinkBuffer)
+		buf := netpoll.NewLinkBuffer(pkgsize)
+		buf.Malloc(pkgsize)
+		pb.LinkBuffer = buf
+		queue.Add(pb)
 	}
 
 	err = queue.Close()

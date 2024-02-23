@@ -108,9 +108,9 @@ type Reader interface {
 // The usage of the design is a two-step operation, first apply for a section of memory,
 // fill it and then submit. E.g:
 //
-//  var buf, _ = Malloc(n)
-//  buf = append(buf[:0], ...)
-//  Flush()
+//	var buf, _ = Malloc(n)
+//	buf = append(buf[:0], ...)
+//	Flush()
 //
 // Note that it is not recommended to submit self-managed buffers to Writer.
 // Since the writer is processed asynchronously, if the self-managed buffer is used and recycled after submission,
@@ -190,6 +190,12 @@ type Writer interface {
 
 	// MallocLen returns the total length of the writable data that has not yet been submitted in the writer.
 	MallocLen() (length int)
+}
+
+// FlushCounter 能够在Flush的时候返回Flush的长度
+type FlushCounter interface {
+	// FlushAndCount Flush的同时返回Flush长度
+	FlushAndCount() (int, error)
 }
 
 // ReadWriter is a combination of Reader and Writer.
